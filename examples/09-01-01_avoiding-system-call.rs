@@ -1,6 +1,7 @@
 use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Instant;
 
 use atomic_wait::{wait, wake_one};
 
@@ -46,7 +47,7 @@ impl<T> Mutex<T> {
     }
 
     /// 待機はstateが2の場合のみする。
-    pub fn lock(&self) -> MutexGuard<T> {
+    pub fn lock(&self) -> MutexGuard<'_, T> {
         // stateが0（ロックされていない）の場合のみ1（ロックされている、待機中のスレッドがない状態）
         // に変更する。
         // 成功した場合、ロックを獲得できるため、MutexGuardを返す。
@@ -110,4 +111,36 @@ impl<T> Drop for MutexGuard<'_, T> {
             wake_one(&self.mutex.state);
         }
     }
+}
+
+/*
+/// シングルスレッド
+fn main() {
+    let m = Mutex::new(0);
+    std::hint::black_box(&m);
+    let start = Instant::now();
+    for _ in 0..5_000_000 {
+        *m.lock() += 1;
+    }
+    let duration = start.elapsed();
+    println!("locked {} times in {:?}", *m.lock(), duration);
+}
+*/
+
+/// マルチスレッド
+fn main() {
+    let m = Mutex::new(0);
+    std::hint::black_box(&m);
+    let start = Instant::now();
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| {
+                for _ in 0..5_000_000 {
+                    *m.lock() += 1;
+                }
+            });
+        }
+    });
+    let duration = start.elapsed();
+    println!("locked {} times in {:?}", *m.lock(), duration);
 }
