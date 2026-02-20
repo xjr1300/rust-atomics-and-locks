@@ -6,9 +6,12 @@ use std::{
 use atomic_wait::{wait, wake_all, wake_one};
 
 pub struct RwLock<T> {
-    /// リーダーの数
+    /// リーダーが待機している場合のリーダの数の2倍の値と、ライターが待機している
+    /// 場合は1を加えた値を保持する。
+    /// また、ライトロックされている場合はu32::MAXになる。
     ///
-    /// ライトロックされている場合はu32::MAXになる。
+    /// つまり、リーダーが存在する場合は偶数、ライターが存在する場合は奇数になる。
+    /// なお、u32::MAXは奇数である。
     state: AtomicU32,
 
     /// ライターを起こす際にインクリメント
@@ -33,11 +36,12 @@ impl<T> RwLock<T> {
     pub fn read(&self) -> ReadGuard<'_, T> {
         let mut s = self.state.load(Ordering::Relaxed);
         loop {
-            if s < u32::MAX {
-                assert!(s != u32::MAX - 1, "too many readers");
+            if s.is_multiple_of(2) {
+                // リーダーしか待機していない
+                assert!(s != u32::MAX - 2, "too many readers");
                 match self.state.compare_exchange_weak(
                     s,
-                    s + 1,
+                    s + 2,
                     Ordering::Acquire,
                     Ordering::Relaxed,
                 ) {
@@ -45,34 +49,56 @@ impl<T> RwLock<T> {
                     Err(e) => s = e,
                 }
             } else {
-                // self.stateがu32::MAXの場合、つまりライトロックされている場合は、
-                // ライトロックが解除されるのを待つ。
+                // ライターが待機している
                 wait(&self.state, u32::MAX);
-
-                // 解除されたらリーダの数を再読み込みして、ループの先頭でリーダロックを試みる。
                 s = self.state.load(Ordering::Relaxed);
             }
         }
     }
 
     pub fn write(&self) -> WriteGuard<'_, T> {
-        while self
-            .state
-            .compare_exchange(0, u32::MAX, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            // ReaderGuardのdropと先行発生関係が発生しており、writer_wake_counterがインクリ
-            // メントされていることを観測した場合、stateはデクリメントされている。
-            // もし、ReaderGuardのdropで、writer_wake_counterが増えていた場合、stateが
-            // 0になっていることを観測できる場合がある。このとき、ライターロックを待機せずに取得できる。
+        let mut s = self.state.load(Ordering::Relaxed);
+        loop {
+            // ライターのみ待機している場合は、アンロックされていたらロックを試みる。
+            if s <= 1 {
+                match self
+                    .state
+                    .compare_exchange(s, u32::MAX, Ordering::Acquire, Ordering::Relaxed)
+                {
+                    Ok(_) => return WriteGuard { rwlock: self },
+                    Err(e) => {
+                        // ループの先頭でロックの状態を確認するために、比較交換で失敗したときにえられたstateの値
+                        // をsに保存する。
+                        s = e;
+                        continue;
+                    }
+                }
+            }
+
+            // ロックに失敗した場合、ライタースタベーションを回避するため、新しいリーダーをreadメソッド
+            // で待機させるために、stateを奇数にする。
+            if s.is_multiple_of(2) {
+                match self
+                    .state
+                    .compare_exchange(s, s + 1, Ordering::Relaxed, Ordering::Relaxed)
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        s = e;
+                        continue;
+                    }
+                }
+            }
+
+            // まだロックされていたら待機する。
             let w = self.writer_wake_counter.load(Ordering::Acquire);
-            if self.state.load(Ordering::Relaxed) != 0 {
-                // RwLockがロックされている場合は待機する。
-                // ただし、待機しているライターの数が、上で取得したライターの数と一致するときのみ待機する。
+            s = self.state.load(Ordering::Relaxed);
+            if s >= 2 {
+                // リーダーまたはライターが待機している場合は待機する。
                 wait(&self.writer_wake_counter, w);
+                s = self.state.load(Ordering::Relaxed);
             }
         }
-        WriteGuard { rwlock: self }
     }
 }
 
@@ -90,9 +116,10 @@ impl<T> std::ops::Deref for ReadGuard<'_, T> {
 
 impl<T> Drop for ReadGuard<'_, T> {
     fn drop(&mut self) {
-        if self.rwlock.state.fetch_sub(1, Ordering::Release) == 1 {
-            // 最後のリーダー（ここではstateが1から0になったとき）がロックを解除したとき、
-            // 待機しているライターを起こす。
+        // stateを2減らすことで、リーダーの待機数が1つ減る。
+        if self.rwlock.state.fetch_sub(2, Ordering::Release) == 3 {
+            // state3から１になった場合、RwLockがアンロックされ、かつ待機中のライターが存在する。
+            // このライターを起こす。
             self.rwlock
                 .writer_wake_counter
                 .fetch_add(1, Ordering::Release);
