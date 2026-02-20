@@ -11,6 +11,9 @@ pub struct RwLock<T> {
     /// ライトロックされている場合はu32::MAXになる。
     state: AtomicU32,
 
+    /// ライターを起こす際にインクリメント
+    writer_wake_counter: AtomicU32,
+
     /// データ
     value: UnsafeCell<T>,
 }
@@ -22,6 +25,7 @@ impl<T> RwLock<T> {
     pub const fn new(value: T) -> Self {
         Self {
             state: AtomicU32::new(0),
+            writer_wake_counter: AtomicU32::new(0),
             value: UnsafeCell::new(value),
         }
     }
@@ -52,16 +56,22 @@ impl<T> RwLock<T> {
     }
 
     pub fn write(&self) -> WriteGuard<'_, T> {
-        while let Err(s) =
-            self.state
-                .compare_exchange(0, u32::MAX, Ordering::Acquire, Ordering::Relaxed)
+        while self
+            .state
+            .compare_exchange(0, u32::MAX, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
         {
-            // self.stateが0でない場合、つまりリーダーがいるかライトロックされている場合は、
-            // ロックが解除されるのを待つ。
-            wait(&self.state, s);
+            // ReaderGuardのdropと先行発生関係が発生しており、writer_wake_counterがインクリ
+            // メントされていることを観測した場合、stateはデクリメントされている。
+            // もし、ReaderGuardのdropで、writer_wake_counterが増えていた場合、stateが
+            // 0になっていることを観測できる場合がある。このとき、ライターロックを待機せずに取得できる。
+            let w = self.writer_wake_counter.load(Ordering::Acquire);
+            if self.state.load(Ordering::Relaxed) != 0 {
+                // RwLockがロックされている場合は待機する。
+                // ただし、待機しているライターの数が、上で取得したライターの数と一致するときのみ待機する。
+                wait(&self.writer_wake_counter, w);
+            }
         }
-        // ループを抜けたら、self.stateが0、つまりロックされていない状態からu32::MAXに交換
-        // できたため、ライターロックを返す。
         WriteGuard { rwlock: self }
     }
 }
@@ -81,10 +91,12 @@ impl<T> std::ops::Deref for ReadGuard<'_, T> {
 impl<T> Drop for ReadGuard<'_, T> {
     fn drop(&mut self) {
         if self.rwlock.state.fetch_sub(1, Ordering::Release) == 1 {
-            // 最後のリーダーがロックを解除した場合、つまりself.stateが1から0になった場合は、
-            // 待機中のリーダーが存在しないことを示すため、ライターがロックできる。
-            // したがって、待機中のライターが存在する場合、ライトロックが解除されたことを通知する。
-            wake_one(&self.rwlock.state);
+            // 最後のリーダー（ここではstateが1から0になったとき）がロックを解除したとき、
+            // 待機しているライターを起こす。
+            self.rwlock
+                .writer_wake_counter
+                .fetch_add(1, Ordering::Release);
+            wake_one(&self.rwlock.writer_wake_counter);
         }
     }
 }
@@ -110,7 +122,10 @@ impl<T> std::ops::DerefMut for WriteGuard<'_, T> {
 impl<T> Drop for WriteGuard<'_, T> {
     fn drop(&mut self) {
         self.rwlock.state.store(0, Ordering::Release);
-        // 待機しているリーダーとライターをすべて起こす。
+        self.rwlock
+            .writer_wake_counter
+            .fetch_add(1, Ordering::Release);
+        wake_one(&self.rwlock.writer_wake_counter);
         wake_all(&self.rwlock.state);
     }
 }
